@@ -1,0 +1,8 @@
+* text=auto
+*.py text eol=lf
+*.swift text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.svg text eol=lf
+*.png binary
+*.icns binary

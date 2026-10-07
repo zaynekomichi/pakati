@@ -1,0 +1,24 @@
+# Generated builds, checkpoints, and local test state
+/work/
+/outputs/
+/build/
+/dist/
+*.app/
+*.dmg
+*.zip
+*.spec
+.agent-relay/
+.agent-relay.json
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+
+# Local credentials
+.env
+.env.*
+!.env.example
