@@ -81,6 +81,8 @@ struct SavedSettings: Codable {
     var schemaVersion = 1
     var selectedID: UUID?
     var tasks: [RelayTask]
+    var codexCLIPath: String? = nil
+    var claudeCLIPath: String? = nil
 }
 
 struct Checkpoint: Identifiable {
@@ -119,12 +121,119 @@ struct EngineOutput {
     var json: [String: Any]? { (try? JSONSerialization.jsonObject(with: Data(stdout.utf8))) as? [String: Any] }
 }
 
+struct ManagedRunState: Sendable {
+    let status: String
+    var projectPath: String?
+    var agent: String?
+    var runID: String?
+    var detail: String
+    var switchCount: Int
+    var pid: Int?
+    var writerActive = false
+
+    init(status: String, detail: String = "", projectPath: String? = nil, agent: String? = nil) {
+        self.status = status; self.detail = detail; self.projectPath = projectPath; self.agent = agent
+        switchCount = 0
+    }
+    init?(_ json: [String: Any]) {
+        let accepted: Set<String> = ["idle", "running", "checkpointing", "switching", "completed", "blocked", "stopped", "failed", "interrupted"]
+        guard let status = json["status"] as? String, accepted.contains(status) else { return nil }
+        self.status = status
+        detail = String((json["detail"] as? String ?? "").prefix(2048))
+        if let path = json["project_path"] as? String, path.hasPrefix("/"), path.utf8.count < 8192 { projectPath = path }
+        agent = json["agent"] as? String
+        runID = (json["run_id"] as? String).map { String($0.prefix(128)) }
+        switchCount = max(0, json["switch_count"] as? Int ?? 0)
+        pid = json["pid"] as? Int
+        writerActive = json["writer_active"] as? Bool == true || json["cleanup_pending"] as? Bool == true
+    }
+    var isActive: Bool { ["starting", "running", "checkpointing", "switching", "stopping"].contains(status) }
+    var blocksWrites: Bool { isActive || writerActive || status == "checking" || status == "unknown" }
+    var title: String {
+        if writerActive, !isActive { return "Waiting for previous agent to stop" }
+        switch status {
+        case "starting": return "Starting agent"
+        case "running": return "Agent is working"
+        case "checkpointing": return "Saving progress"
+        case "switching": return "Continuing with the other agent"
+        case "completed": return "Agent response finished"
+        case "blocked": return "Run needs attention"
+        case "stopping": return "Stopping agent"
+        case "stopped": return "Run stopped"
+        case "failed": return "Run failed"
+        case "interrupted": return "Run interrupted"
+        case "checking": return "Checking run status"
+        case "unknown": return "Run status unavailable"
+        default: return "Ready to start"
+        }
+    }
+}
+
+final class ManagedEngineProcess {
+    private let process = Process()
+    private let stdout = Pipe()
+    private let stderr = Pipe()
+    private let readers = DispatchGroup()
+    private let onState: (ManagedRunState) -> Void
+    private let onFinish: (Int32) -> Void
+
+    init(onState: @escaping (ManagedRunState) -> Void, onFinish: @escaping (Int32) -> Void) {
+        self.onState = onState; self.onFinish = onFinish
+    }
+    func start(dataDirectory: URL, project: String, arguments: [String]) throws {
+        process.executableURL = try EngineRunner.prepareRuntime(dataDirectory: dataDirectory)
+        process.arguments = arguments; process.environment = EngineRunner.environment()
+        process.currentDirectoryURL = URL(fileURLWithPath: project, isDirectory: true)
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = stdout; process.standardError = stderr
+        try process.run()
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { self.readers.leave() }
+            var line = Data(), oversized = false
+            while let chunk = try? self.stdout.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
+                for byte in chunk {
+                    if byte == 10 {
+                        if !oversized { self.consume(line) }
+                        line.removeAll(keepingCapacity: true); oversized = false
+                    } else if !oversized {
+                        if line.count < 32768 { line.append(byte) }
+                        else { line.removeAll(keepingCapacity: true); oversized = true }
+                    }
+                }
+            }
+            if !oversized, !line.isEmpty { self.consume(line) }
+        }
+        readers.enter()
+        DispatchQueue.global(qos: .userInitiated).async {
+            defer { self.readers.leave() }
+            // Agent transcripts and stderr never enter the UI or an app log.
+            while let bytes = try? self.stderr.fileHandleForReading.read(upToCount: 4096), !bytes.isEmpty {}
+        }
+        DispatchQueue.global(qos: .utility).async {
+            self.process.waitUntilExit(); self.readers.wait()
+            self.onFinish(self.process.terminationStatus)
+        }
+    }
+    private func consume(_ line: Data) {
+        guard let json = (try? JSONSerialization.jsonObject(with: line)) as? [String: Any],
+              json["type"] as? String == "state", let state = ManagedRunState(json) else { return }
+        onState(state)
+    }
+}
+
 enum EngineError: LocalizedError {
     case message(String)
     var errorDescription: String? { switch self { case .message(let text): return text } }
 }
 
 enum EngineRunner {
+    static func environment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin:\(home)/.local/bin:\(home)/.npm-global/bin"
+        return environment
+    }
     static func dataDirectory() -> URL {
         if let override = ProcessInfo.processInfo.environment["AGENT_RELAY_DATA_DIR"], !override.isEmpty {
             return URL(fileURLWithPath: override, isDirectory: true).standardizedFileURL
@@ -162,14 +271,12 @@ enum EngineRunner {
         }
         return stable
     }
-    static func run(dataDirectory: URL, arguments: [String]) throws -> EngineOutput {
+    static func run(dataDirectory: URL, arguments: [String], allowFailure: Bool = false) throws -> EngineOutput {
         let executable = try prepareRuntime(dataDirectory: dataDirectory)
         let process = Process(); process.executableURL = executable; process.arguments = arguments
         let outputPipe = Pipe(), errorPipe = Pipe()
         process.standardOutput = outputPipe; process.standardError = errorPipe
-        var environment = ProcessInfo.processInfo.environment
-        environment["PATH"] = "/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/bin:/opt/homebrew/bin"
-        process.environment = environment
+        process.environment = environment()
         try process.run()
         // Read both streams concurrently so large task notes cannot fill one pipe and block the engine.
         let readers = DispatchGroup(), lock = NSLock()
@@ -186,7 +293,7 @@ enum EngineRunner {
         }
         process.waitUntilExit(); readers.wait()
         let output = EngineOutput(stdout: String(decoding: stdout, as: UTF8.self), stderr: String(decoding: stderr, as: UTF8.self))
-        guard process.terminationStatus == 0 else {
+        guard process.terminationStatus == 0 || allowFailure else {
             let detail = output.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
             throw EngineError.message(detail.isEmpty ? output.stdout : detail)
         }
@@ -205,8 +312,19 @@ enum EngineRunner {
     @Published var savedNotes = ""
     @Published var showingAdd = false
     @Published var restoredPath: String?
+    @Published var codexCLIPath = ""
+    @Published var claudeCLIPath = ""
+    @Published var managedStates: [UUID: ManagedRunState] = [:]
+    @Published var stoppingTasks: Set<UUID> = []
     let dataDirectory: URL
     private var settingsRecoveryNeeded = false
+    private var managedProcesses: [UUID: ManagedEngineProcess] = [:]
+    private var startGenerations: [UUID: UUID] = [:]
+    private var workerGenerations: [UUID: UUID] = [:]
+    private var activityRevisions: [UUID: Int] = [:]
+    private var statusChecks: Set<UUID> = []
+    private var observedTasks: Set<UUID> = []
+    private var quitting = false
     var storeURL: URL { dataDirectory.appendingPathComponent("checkpoints", isDirectory: true) }
     var selectedTask: RelayTask? { tasks.first { $0.id == selectedID } }
     var checkpoint: Checkpoint? { history.first { $0.id == selectedVersion } ?? history.first }
@@ -219,6 +337,8 @@ enum EngineRunner {
                 let saved = try JSONDecoder().decode(SavedSettings.self, from: Data(contentsOf: settings))
                 guard saved.schemaVersion == 1 else { throw EngineError.message("This settings file uses an unsupported version.") }
                 tasks = saved.tasks
+                codexCLIPath = saved.codexCLIPath ?? ""
+                claudeCLIPath = saved.claudeCLIPath ?? ""
                 selectedID = tasks.contains { $0.id == saved.selectedID } ? saved.selectedID : tasks.first?.id
                 for task in tasks {
                     task.configured = configurationMatches(task)
@@ -248,7 +368,9 @@ enum EngineRunner {
                 settingsRecoveryNeeded = false
             }
             let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(SavedSettings(selectedID: selectedID, tasks: tasks))
+            try encoder.encode(SavedSettings(selectedID: selectedID, tasks: tasks,
+                    codexCLIPath: codexCLIPath.isEmpty ? nil : codexCLIPath,
+                    claudeCLIPath: claudeCLIPath.isEmpty ? nil : claudeCLIPath))
                 .write(to: dataDirectory.appendingPathComponent("settings.json"), options: .atomic)
         } catch { status = RelayStatus(title: "Settings could not be saved", detail: error.localizedDescription, isError: true) }
     }
@@ -308,6 +430,7 @@ enum EngineRunner {
         return text
     }
     func chooseProject(for task: RelayTask) {
+        guard !isManagedWriting(task) else { showManagedWriteConflict(); return }
         let panel = NSOpenPanel(); panel.canChooseDirectories = true; panel.canChooseFiles = false
         panel.allowsMultipleSelection = false; panel.prompt = "Use folder"; panel.title = "Choose a Git project or worktree"
         panel.directoryURL = URL(fileURLWithPath: task.projectPath)
@@ -339,27 +462,285 @@ enum EngineRunner {
         }.sorted { $0.timestamp > $1.timestamp }
         if !history.contains(where: { $0.id == selectedVersion }) { selectedVersion = history.first?.id }
     }
-    private func execute(_ name: String, arguments: [String], success: @escaping (EngineOutput) throws -> Void) {
+    private func execute(_ name: String, arguments: [String], allowFailure: Bool = false, success: @escaping (EngineOutput) throws -> Void) {
         guard !busy else { return }
         busy = true; operation = name; status = nil
         let directory = dataDirectory
         Task {
             do {
                 let output = try await Task.detached(priority: .userInitiated) {
-                    try EngineRunner.run(dataDirectory: directory, arguments: arguments)
+                    try EngineRunner.run(dataDirectory: directory, arguments: arguments, allowFailure: allowFailure)
                 }.value
                 try success(output)
             } catch { status = RelayStatus(title: "\(name) failed", detail: error.localizedDescription, isError: true) }
             busy = false; operation = ""; persist()
         }
     }
+    func managedState(for task: RelayTask) -> ManagedRunState {
+        managedStates[task.id] ?? ManagedRunState(status: "idle")
+    }
+    func isManagedTaskActive(_ task: RelayTask) -> Bool {
+        managedState(for: task).isActive || managedState(for: task).writerActive || managedProcesses[task.id] != nil || startGenerations[task.id] != nil
+    }
+    func isManagedWriting(_ task: RelayTask) -> Bool {
+        if managedState(for: task).blocksWrites || isManagedTaskActive(task) { return true }
+        let folder = canonicalStorePath(URL(fileURLWithPath: task.projectPath, isDirectory: true))
+        return tasks.contains { other in
+            guard other.id != task.id, managedState(for: other).blocksWrites || isManagedTaskActive(other) else { return false }
+            let path = managedState(for: other).projectPath ?? other.projectPath
+            return canonicalStorePath(URL(fileURLWithPath: path, isDirectory: true)) == folder
+        }
+    }
+    var hasManagedRuns: Bool {
+        !managedProcesses.isEmpty || !startGenerations.isEmpty || managedStates.values.contains { $0.isActive || $0.writerActive }
+    }
+    private func showManagedWriteConflict() {
+        status = RelayStatus(title: "This folder is in use", detail: "Stop the managed agent and wait for it to finish before changing this folder or saving task notes.", isError: true)
+    }
+    private func cliArguments() throws -> [String] {
+        var arguments: [String] = []
+        for (flag, value) in [("--codex-cli", codexCLIPath), ("--claude-cli", claudeCLIPath)] {
+            let text = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty {
+                let path = (text as NSString).expandingTildeInPath
+                guard path.hasPrefix("/"), FileManager.default.isExecutableFile(atPath: path) else {
+                    throw EngineError.message("Choose an executable file for \(flag == "--codex-cli" ? "Codex" : "Claude Code"), or leave its path empty for automatic discovery.")
+                }
+                arguments += [flag, path]
+            }
+        }
+        return arguments
+    }
+    func chooseCLI(_ assistant: Assistant) {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false; panel.title = "Choose the \(assistant.title) command-line executable"
+        panel.prompt = "Use executable"; panel.showsHiddenFiles = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard FileManager.default.isExecutableFile(atPath: url.path) else {
+            status = RelayStatus(title: "Choose an executable file", detail: "The selected file cannot be executed.", isError: true); return
+        }
+        if assistant == .codex { codexCLIPath = url.path } else { claudeCLIPath = url.path }
+        persist()
+    }
+    func checkCLIs() {
+        do {
+            let arguments = try cliArguments()
+            execute("Check command-line agents", arguments: ["auto", "preflight"] + arguments, allowFailure: true) { output in
+                guard let json = output.json, json["ready"] as? Bool == true else {
+                    throw EngineError.message(self.preflightDetail(output.json))
+                }
+                self.status = RelayStatus(title: "Command-line agents are available", detail: String((json["detail"] as? String ?? "Codex and Claude Code are ready for a managed run.").prefix(1024)))
+            }
+        } catch { status = RelayStatus(title: "Command-line agents need setup", detail: error.localizedDescription, isError: true) }
+    }
+    private func preflightDetail(_ json: [String: Any]?) -> String {
+        guard let json = json else { return "The command-line agents could not be checked. Install and sign in to Codex and Claude Code, then check again." }
+        var details: [String] = []
+        if let agents = json["agents"] as? [String: Any] {
+            for assistant in Assistant.allCases {
+                if let agent = agents[assistant.rawValue] as? [String: Any], agent["available"] as? Bool != true {
+                    details.append("\(assistant.title): \(String((agent["detail"] as? String ?? "executable not found or unsupported").prefix(256)))")
+                }
+            }
+        }
+        if details.isEmpty { details.append(String((json["detail"] as? String ?? "Both command-line agents must be available before starting.").prefix(512))) }
+        return details.joined(separator: "\n")
+    }
+    func applyManagedState(_ state: ManagedRunState, to task: RelayTask) {
+        let untouched = task.notesBaseline.map { task.notes == $0 } ?? (task.notes == initialNotes)
+        managedStates[task.id] = state
+        activityRevisions[task.id, default: 0] += 1
+        if let path = state.projectPath { task.projectPath = path }
+        if let agent = state.agent, let assistant = Assistant(rawValue: agent) { task.assistant = assistant }
+        task.configured = configurationMatches(task)
+        if untouched, let notes = readProjectNotes(task) { task.notes = notes; task.notesBaseline = notes }
+        if selectedID == task.id { refreshHistory() }
+        persist()
+        observeExistingWorker(task)
+    }
+    private func observeExistingWorker(_ task: RelayTask) {
+        let state = managedState(for: task)
+        guard managedProcesses[task.id] == nil, startGenerations[task.id] == nil,
+              state.isActive || state.writerActive, !observedTasks.contains(task.id) else { return }
+        observedTasks.insert(task.id)
+        Task {
+            defer { self.observedTasks.remove(task.id) }
+            while self.managedProcesses[task.id] == nil && self.startGenerations[task.id] == nil && self.isManagedTaskActive(task) {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                await self.reloadManagedStatus(task, showChecking: false)
+            }
+        }
+    }
+    private func receiveManagedState(_ state: ManagedRunState, task: RelayTask, generation: UUID) {
+        guard workerGenerations[task.id] == generation else { return }
+        applyManagedState(state, to: task)
+    }
+    private func receivePolledState(_ state: ManagedRunState, task: RelayTask, revision: Int) {
+        guard activityRevisions[task.id, default: 0] == revision,
+              managedProcesses[task.id] == nil, startGenerations[task.id] == nil else { return }
+        applyManagedState(state, to: task)
+    }
+    private func managedWorkerFinished(_ task: RelayTask, generation: UUID, exitCode: Int32) async {
+        guard workerGenerations[task.id] == generation else { return }
+        managedProcesses.removeValue(forKey: task.id)
+        workerGenerations.removeValue(forKey: task.id)
+        startGenerations.removeValue(forKey: task.id)
+        if exitCode != 0, managedState(for: task).isActive {
+            managedStates[task.id] = ManagedRunState(status: "stopping", detail: "The worker exited unexpectedly. Checking that its agent stopped before this folder can be edited.", projectPath: task.projectPath, agent: task.assistant.rawValue)
+        }
+        await reloadManagedStatus(task, showChecking: false)
+    }
+    func reloadManagedStatus(_ task: RelayTask, showChecking: Bool = true) async {
+        guard managedProcesses[task.id] == nil else { return }
+        guard !statusChecks.contains(task.id) else { return }
+        statusChecks.insert(task.id); defer { statusChecks.remove(task.id) }
+        let revision = activityRevisions[task.id, default: 0]
+        if showChecking, !isManagedTaskActive(task) { managedStates[task.id] = ManagedRunState(status: "checking") }
+        let directory = dataDirectory
+        let arguments = ["auto", "status", "--task", task.taskID, "--store", storeURL.path]
+        do {
+            let output = try await Task.detached(priority: .utility) { try EngineRunner.run(dataDirectory: directory, arguments: arguments) }.value
+            guard let json = output.json, let state = ManagedRunState(json) else { throw EngineError.message("The engine returned an invalid managed-run status.") }
+            receivePolledState(state, task: task, revision: revision)
+        } catch {
+            if activityRevisions[task.id, default: 0] == revision, managedProcesses[task.id] == nil,
+               startGenerations[task.id] == nil, !isManagedTaskActive(task) {
+                managedStates[task.id] = ManagedRunState(status: "unknown", detail: "The managed-run status could not be read. Check the app installation and refresh the status before editing this folder.")
+            }
+        }
+    }
+    func restoreManagedStatuses() async {
+        // Relaunch observes saved workers; it never starts or resumes an agent.
+        for task in tasks { await reloadManagedStatus(task) }
+    }
+    private func requireSavedNotes(_ task: RelayTask) throws {
+        guard let baseline = task.notesBaseline, let diskNotes = readProjectNotes(task),
+              diskNotes == baseline, task.notes == baseline else {
+            throw EngineError.message("Save your notes and checkpoint first. If the project notes changed in another agent, copy any unsaved draft you need, load the current project notes, and merge your changes before saving. Your draft and project notes have been preserved.")
+        }
+    }
+    func startManagedRun(_ task: RelayTask) {
+        guard !busy, !isManagedWriting(task), !quitting else { return }
+        guard configurationMatches(task) else {
+            task.configured = false
+            status = RelayStatus(title: "Configure this folder first", detail: "Automatic handoff requires a configured project with real task notes.", isError: true); return
+        }
+        let notes = task.notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !notes.isEmpty, notes != initialNotes, !notes.contains("agent-relay-template") else {
+            status = RelayStatus(title: "Add real task notes first", detail: "Record the goal and next steps before starting a managed agent.", isError: true); return
+        }
+        do { try requireSavedNotes(task) }
+        catch {
+            status = RelayStatus(title: "Save your notes and checkpoint first", detail: error.localizedDescription, isError: true); return
+        }
+        do {
+            let optionalCLIArguments = try cliArguments()
+            let generation = UUID(); startGenerations[task.id] = generation
+            activityRevisions[task.id, default: 0] += 1
+            managedStates[task.id] = ManagedRunState(status: "starting", detail: "Checking the installed command-line agents.", projectPath: task.projectPath, agent: task.assistant.rawValue)
+            busy = true; operation = "Prepare automatic handoff"; status = nil
+            let directory = dataDirectory
+            let statusArguments = ["auto", "status", "--task", task.taskID, "--store", storeURL.path]
+            Task {
+                do {
+                    let ready = try await Task.detached(priority: .userInitiated) {
+                        try EngineRunner.run(dataDirectory: directory, arguments: ["auto", "preflight"] + optionalCLIArguments, allowFailure: true)
+                    }.value
+                    guard ready.json?["ready"] as? Bool == true else { throw EngineError.message(self.preflightDetail(ready.json)) }
+                    let previous = try await Task.detached(priority: .userInitiated) {
+                        try EngineRunner.run(dataDirectory: directory, arguments: statusArguments)
+                    }.value
+                    guard let json = previous.json, let previousState = ManagedRunState(json) else { throw EngineError.message("The existing managed-run status could not be verified.") }
+                    if previousState.isActive || previousState.writerActive {
+                        self.applyManagedState(previousState, to: task)
+                        throw EngineError.message("A managed agent is already working on this task. Stop it before starting another run.")
+                    }
+                    guard self.startGenerations[task.id] == generation, !self.quitting else {
+                        self.busy = false; self.operation = ""; return
+                    }
+                    try self.requireSavedNotes(task)
+                    self.persist()
+                    let arguments = ["auto", "run", "--task", task.taskID, "--store", self.storeURL.path,
+                        "--project", task.projectPath, "--agent", task.assistant.rawValue,
+                        "--handoff-root", self.dataDirectory.appendingPathComponent("handoffs", isDirectory: true).path,
+                        "--max-switches", "1"] + optionalCLIArguments
+                    let runner = ManagedEngineProcess(onState: { [weak self, weak task] state in
+                        Task { @MainActor in
+                            guard let self = self, let task = task else { return }
+                            self.receiveManagedState(state, task: task, generation: generation)
+                        }
+                    }, onFinish: { [weak self, weak task] code in
+                        Task { @MainActor in
+                            guard let self = self, let task = task else { return }
+                            await self.managedWorkerFinished(task, generation: generation, exitCode: code)
+                        }
+                    })
+                    self.workerGenerations[task.id] = generation
+                    self.managedProcesses[task.id] = runner
+                    do { try runner.start(dataDirectory: directory, project: task.projectPath, arguments: arguments) }
+                    catch { self.managedProcesses.removeValue(forKey: task.id); self.workerGenerations.removeValue(forKey: task.id); throw error }
+                    self.startGenerations.removeValue(forKey: task.id)
+                } catch {
+                    self.startGenerations.removeValue(forKey: task.id)
+                    if !self.managedState(for: task).isActive || self.managedState(for: task).status == "starting" {
+                        self.managedStates[task.id] = ManagedRunState(status: "failed", detail: String(error.localizedDescription.prefix(1024)), projectPath: task.projectPath, agent: task.assistant.rawValue)
+                    }
+                    self.status = RelayStatus(title: "Automatic handoff could not start", detail: String(error.localizedDescription.prefix(1024)), isError: true)
+                }
+                self.busy = false; self.operation = ""; self.persist()
+            }
+        } catch { status = RelayStatus(title: "Command-line agents need setup", detail: error.localizedDescription, isError: true) }
+    }
+    func stopManagedRun(_ task: RelayTask) {
+        guard !stoppingTasks.contains(task.id) else { return }
+        let wasStarting = startGenerations.removeValue(forKey: task.id) != nil
+        activityRevisions[task.id, default: 0] += 1
+        if wasStarting, managedProcesses[task.id] == nil, managedState(for: task).status == "starting" {
+            managedStates[task.id] = ManagedRunState(status: "stopped", detail: "The run was cancelled before an agent started."); return
+        }
+        guard isManagedTaskActive(task) || managedState(for: task).status == "unknown" else { return }
+        stoppingTasks.insert(task.id)
+        managedStates[task.id] = ManagedRunState(status: "stopping", detail: "Waiting for the worker to stop its agent and preserve the final checkpoint.", projectPath: task.projectPath, agent: task.assistant.rawValue)
+        let directory = dataDirectory
+        let arguments = ["auto", "stop", "--task", task.taskID, "--store", storeURL.path]
+        Task {
+            defer { self.stoppingTasks.remove(task.id) }
+            do {
+                _ = try await Task.detached(priority: .userInitiated) { try EngineRunner.run(dataDirectory: directory, arguments: arguments) }.value
+                for _ in 0..<30 {
+                    await self.reloadManagedStatus(task, showChecking: false)
+                    if !self.isManagedTaskActive(task) { return }
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+                self.status = RelayStatus(title: "The agent is still stopping", detail: "Keep Pakati open while the worker finishes. You can retry Stop if this status persists.", isError: true)
+            } catch {
+                self.status = RelayStatus(title: "Stop request could not be completed", detail: "The worker has not confirmed that its agent stopped. Keep Pakati open and refresh the run status before retrying.", isError: true)
+            }
+        }
+    }
+    func prepareToQuit(_ completion: @escaping (Bool) -> Void) {
+        guard !quitting else { return }
+        quitting = true
+        for task in tasks where isManagedTaskActive(task) { stopManagedRun(task) }
+        Task {
+            for _ in 0..<35 {
+                if !self.hasManagedRuns { self.quitting = false; completion(true); return }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+            self.quitting = false
+            self.status = RelayStatus(title: "Pakati is waiting for the agent to stop", detail: "The worker has not finished cleaning up. Keep the app open, refresh its status, and retry Stop before quitting.", isError: true)
+            completion(false)
+        }
+    }
     func configure(_ task: RelayTask) {
+        guard !isManagedWriting(task) else { showManagedWriteConflict(); return }
         execute("Configure project", arguments: ["setup", "--project", task.projectPath, "--store", storeURL.path, "--task", task.taskID]) { output in
             task.configured = self.configurationMatches(task)
             self.status = RelayStatus(title: "Project configured", detail: output.stdout + output.stderr)
         }
     }
     func saveCheckpoint(_ task: RelayTask) {
+        guard !isManagedWriting(task) else { showManagedWriteConflict(); return }
         guard configurationMatches(task) else {
             task.configured = false
             status = RelayStatus(title: "Configure this folder first", detail: "This folder's relay configuration does not match the selected task and shared store.", isError: true)
@@ -409,6 +790,7 @@ enum EngineRunner {
         }
     }
     func restore(_ task: RelayTask) {
+        guard !isManagedWriting(task) else { showManagedWriteConflict(); return }
         guard let version = selectedVersion ?? history.first?.id else { return }
         let panel = NSSavePanel(); panel.title = "Restore into a new folder"; panel.prompt = "Restore here"
         panel.message = "Choose a new folder name. Pakati recreates this checkpoint there and leaves the active folder intact."
@@ -557,9 +939,14 @@ struct TaskDetail: View {
                     .pickerStyle(.segmented).frame(width: 310).padding(.bottom, 18)
                 HStack(alignment: .top, spacing: 20) {
                     VStack(alignment: .leading, spacing: 16) {
-                        if tab == 0 { notesCard } else { historyCard }
+                        if tab == 0 { notesCard.disabled(model.busy || model.isManagedWriting(task)) }
+                        else { historyCard.disabled(model.busy) }
                     }.frame(maxWidth: .infinity)
-                    VStack(alignment: .leading, spacing: 16) { projectCard; handoffCard }
+                    VStack(alignment: .leading, spacing: 16) {
+                        managedCard
+                        projectCard.disabled(model.busy)
+                        handoffCard.disabled(model.busy || model.isManagedWriting(task))
+                    }
                         .frame(width: 280)
                 }
             }
@@ -568,9 +955,69 @@ struct TaskDetail: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(Color(nsColor: .windowBackgroundColor))
-        .disabled(model.busy)
         .onChange(of: task.notes) { _ in model.persist() }
         .onChange(of: task.assistant) { _ in model.persist() }
+        .onChange(of: model.codexCLIPath) { _ in model.persist() }
+        .onChange(of: model.claudeCLIPath) { _ in model.persist() }
+    }
+    private var managedCard: some View {
+        let state = model.managedState(for: task)
+        return Card(title: "Automatic handoff", symbol: "arrow.triangle.swap") {
+            Text("Runs the installed command-line agents. Stop any agent already editing this folder before starting.")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Picker("Start with", selection: $task.assistant) {
+                ForEach(Assistant.allCases) { assistant in Text(assistant.title).tag(assistant) }
+            }.pickerStyle(.segmented).disabled(model.busy || model.isManagedWriting(task))
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 7) {
+                    if model.isManagedTaskActive(task) { ProgressView().controlSize(.small) }
+                    Text(state.title).font(.system(size: 12, weight: .semibold))
+                }
+                if !state.detail.isEmpty {
+                    Text(state.detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if state.writerActive, !state.isActive {
+                    Text("Waiting for the previous agent to stop before this folder can be edited.")
+                        .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                if let folder = state.projectPath {
+                    Text("Active folder: \(folder)").font(.system(size: 10)).foregroundStyle(.secondary)
+                        .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }
+                if state.switchCount > 0 {
+                    Text("Fallback used: \(state.switchCount) of 1").font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            if model.isManagedTaskActive(task) {
+                Button { model.stopManagedRun(task) } label: { Label("Stop", systemImage: "stop.fill") }
+                    .disabled(model.stoppingTasks.contains(task.id)).frame(maxWidth: .infinity)
+            } else {
+                Button { model.startManagedRun(task) } label: { Label("Start with auto-handoff", systemImage: "play.fill") }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(model.busy || !task.configured || model.isManagedWriting(task)).frame(maxWidth: .infinity)
+            }
+            Button("Refresh run status") { Task { await model.reloadManagedStatus(task) } }
+                .disabled(model.isManagedTaskActive(task) && state.status != "stopping")
+            DisclosureGroup("Command-line agent paths") {
+                VStack(alignment: .leading, spacing: 9) {
+                    Text("Leave empty to discover installed agents.").font(.system(size: 10)).foregroundStyle(.secondary)
+                    cliPathField(.codex, path: $model.codexCLIPath)
+                    cliPathField(.claude, path: $model.claudeCLIPath)
+                    Button("Check agents") { model.checkCLIs() }
+                }.padding(.top, 6).disabled(model.busy || model.hasManagedRuns)
+            }.font(.system(size: 11))
+            Text("Save your notes and checkpoint before starting. Keep Pakati open. A confirmed usage limit transfers progress to a fresh folder and starts the other agent once. Existing desktop chats run independently.")
+                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+    private func cliPathField(_ assistant: Assistant, path: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(assistant.title).font(.system(size: 10, weight: .medium))
+            HStack(spacing: 5) {
+                TextField("Auto-detect", text: path).textFieldStyle(.roundedBorder).font(.system(size: 11))
+                Button { model.chooseCLI(assistant) } label: { Image(systemName: "folder") }.help("Choose executable")
+            }
+        }
     }
     private var notesCard: some View {
         Card(title: "Shared task notes", symbol: "doc.text") {
@@ -602,12 +1049,13 @@ struct TaskDetail: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             HStack {
-                Button("Change folder…") { model.chooseProject(for: task) }
+                Button("Change folder…") { model.chooseProject(for: task) }.disabled(model.isManagedWriting(task))
                 Button { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: task.projectPath) } label: { Image(systemName: "arrow.up.forward.square") }
                     .help("Show active folder in Finder")
             }
             Divider()
-            Button(task.configured ? "Reconfigure project" : "Configure project") { model.configure(task) }.frame(maxWidth: .infinity)
+            Button(task.configured ? "Reconfigure project" : "Configure project") { model.configure(task) }
+                .disabled(model.isManagedWriting(task)).frame(maxWidth: .infinity)
             Text("Adds handoff instructions to AGENTS.md and CLAUDE.md, plus project hooks for both assistants. Existing rules and unrelated settings are preserved.")
                 .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Text("Reopen the assistant session and accept any hook trust prompt after configuration.")
@@ -686,7 +1134,7 @@ struct TaskDetail: View {
                 if !model.savedNotes.isEmpty {
                     ScrollView { Text(model.savedNotes).font(.system(size: 12, design: .monospaced)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading) }
                         .padding(12).frame(minHeight: 160, maxHeight: 240).background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-                    Button("Use these notes in editor") { task.notes = model.savedNotes; tab = 0 }
+                    Button("Use these notes in editor") { task.notes = model.savedNotes; tab = 0 }.disabled(model.isManagedWriting(task))
                 } else {
                     Button("Verify and read selected checkpoint") { model.loadCheckpoint(task) }
                 }
@@ -775,7 +1223,7 @@ struct WelcomeView: View {
                 }.padding(.top, 25)
             }
             Spacer()
-            Text("Stored locally on your Mac. No account or cloud service required.")
+            Text("Checkpoints stay on your Mac. Managed agents use your existing accounts.")
                 .font(.system(size: 11)).foregroundStyle(.secondary).padding(.bottom, 30)
         }.frame(maxWidth: .infinity, maxHeight: .infinity).background(Color(nsColor: .windowBackgroundColor))
     }
@@ -821,11 +1269,29 @@ struct RelayWindow: View {
         .frame(minWidth: 1070, minHeight: 640)
         .onChange(of: model.selectedID) { _ in model.selectTask() }
         .sheet(isPresented: $model.showingAdd) { AddTaskView(model: model) }
+        .task { await model.restoreManagedStatuses() }
         .toolbar {
             ToolbarItem(placement: .automatic) {
                 Button { model.showingAdd = true } label: { Image(systemName: "plus") }.help("Add task").disabled(model.busy)
             }
+            ToolbarItem(placement: .automatic) {
+                if model.hasManagedRuns {
+                    Button {
+                        for task in model.tasks where model.isManagedTaskActive(task) { model.stopManagedRun(task) }
+                    } label: { Label("Stop agents", systemImage: "stop.fill") }
+                    .help("Cooperatively stop all agents supervised by Pakati")
+                }
+            }
         }
+    }
+}
+
+@MainActor final class RelayApplicationDelegate: NSObject, NSApplicationDelegate {
+    weak var model: RelayModel?
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let model = model, model.hasManagedRuns else { return .terminateNow }
+        model.prepareToQuit { allowed in sender.reply(toApplicationShouldTerminate: allowed) }
+        return .terminateLater
     }
 }
 
@@ -867,6 +1333,7 @@ struct RelayWindow: View {
 
 @main struct AgentRelayApp: App {
     @StateObject private var model = RelayModel()
+    @NSApplicationDelegateAdaptor(RelayApplicationDelegate.self) private var appDelegate
     init() {
         if CommandLine.arguments.contains("--smoke-test") {
             guard let value = ProcessInfo.processInfo.environment["AGENT_RELAY_DATA_DIR"], !value.isEmpty else {
@@ -889,6 +1356,7 @@ struct RelayWindow: View {
             RelayWindow(model: model)
                 .tint(Color(nsColor: .labelColor))
                 .accentColor(Color(nsColor: .labelColor))
+                .onAppear { appDelegate.model = model }
         }
             .defaultSize(width: 1160, height: 760)
             .commands {

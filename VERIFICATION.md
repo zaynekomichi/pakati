@@ -1,5 +1,7 @@
 # Verification — Pakati for Mac 0.2.0
 
+The packaged-app checks below describe the existing 0.2.0 downloads. The automatic handoff source update is documented separately at the end; it has not been packaged into a new app or installer.
+
 Verified on an Apple Silicon Mac running macOS 26.6.2. The native app targets macOS 13 or later; macOS 13 itself and Intel Macs were not used for runtime testing. The app and helper are arm64 builds.
 
 ## Automated checks
@@ -50,3 +52,19 @@ The two native test drivers require the Swift command-line toolchain. They compi
 ## Pakati branding update
 
 The app is named Pakati. Its Dock icon and in-app mark use a solid black center dot, white surround, and sixteen radial black lines. Legacy storage and hook identifiers are retained for compatibility. This update changes branding and bundled helper display text; handoff behavior and checkpoint format are unchanged. The rebuilt app and helper are checked again before delivery.
+
+## Automatic handoff source update (unbuilt)
+
+The source adds a managed controller for installed Codex and Claude Code command-line agents, plus native Start/Stop controls, saved executable paths, and live task status. Confirmed account quota failures trigger a final checkpoint, a fresh restore, configuration and adoption of that checkout, then continuation with the other agent. The default allows one switch; both exhausted accounts stop the run.
+
+Verification uses fake local agents and disposable Git repositories. It does not send model requests, consume subscription credits, or change global assistant configuration. The current app downloads and source archive remain the previously delivered versions; use the Git repository for this source update.
+
+**48 Python checks passed:** 18 original source-engine integration tests, 13 managed-controller tests, and 17 independent automatic-handoff regression tests. Coverage includes final capture and fallback continuation, both accounts exhausted, permission denial, temporary limits and quoted quota text, checkpoint ownership, stopped and killed controllers, child-process cleanup, and stale state handling.
+
+**Eight native model check groups passed through the Swift interpreter/JIT.** They cover saved settings, bounded state parsing, draft preservation, same-folder write exclusion, worker generation guards, stale polling, cleanup status, and cancellation before launch. Installed Codex 0.160.0 and Claude Code 2.1.285 passed read-only version/help preflight checks.
+
+The controller checks ordinary response completion separately from quota failure, respects denied tool permissions, preserves agent edits to notes, and maintains exclusive checkout ownership. A successful CLI response is not proof that the user's entire goal has been completed. Subscription event payloads can change; unsupported failures stop with a status instead of guessing and launching a fallback.
+
+Crash and cancellation cleanup covers the managed process group and its ordinary descendants. Intentionally detached processes that create another session and drop inherited locks are outside that guarantee.
+
+The complete native source passed Swift typechecking for arm64 with a macOS 13 deployment target, without creating an app build. Live authenticated agent execution and end-to-end GUI interaction with this new mode are not covered by the fake-agent checks.

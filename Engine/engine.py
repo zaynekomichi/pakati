@@ -44,7 +44,7 @@ def preflight() -> int:
 def main() -> int:
     ensure_path()
     if len(sys.argv) < 2 or sys.argv[1] in ("--help", "-h"):
-        print("Pakati " + VERSION + "\n\nCommands: setup, checkpoint, show, restore, hook, preflight\n"
+        print("Pakati " + VERSION + "\n\nCommands: setup, checkpoint, show, restore, hook, preflight, auto\n"
               "Use COMMAND --help for options. Project hooks use the installed stable engine path.")
         return 0
     command = sys.argv.pop(1)
@@ -59,6 +59,9 @@ def main() -> int:
     if command == "hook":
         import hook
         return hook.main()
+    if command == "auto":
+        import autopilot
+        return autopilot.main()
     if command in ("checkpoint", "show", "restore"):
         import relay
         sys.argv.insert(1, command)

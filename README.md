@@ -10,6 +10,8 @@ Pakati is open source under the [MIT license](LICENSE). Contributions are welcom
 
 ## Install
 
+The automatic handoff mode described below is a source update. The existing 0.2.0 app downloads have not been rebuilt with this feature.
+
 Open `Pakati-mac.dmg` and drag **Pakati** into **Applications**. Open the app from Applications. `Pakati-mac-app.zip` is an alternative copy of the same app; `Pakati-mac-source.zip` contains the editable source and build instructions.
 
 This build targets Apple Silicon Macs running macOS 13 or later. It bundles its Python runtime; you do not need to install Python or use Terminal for ordinary app actions. Git must be available, for example through Apple's Command Line Tools or Xcode. Both coding assistants keep their existing accounts and usage limits.
@@ -25,7 +27,41 @@ The build has an ad-hoc code signature for local testing. It has not been signed
 
 The project hooks capture code during work and load the saved context when a session starts. Ask the agent to keep `.agent-relay/notes.md` current after meaningful progress and before long operations. Git cannot supply the explanation of why a decision was made.
 
-## Continue in the other assistant
+## Automatic handoff
+
+Configure a task, write its goal, progress, constraints, and next steps, then **Save checkpoint**. Choose the starting assistant and select **Start with auto-handoff**. Save any editor draft and resolve newer notes from the project before starting. This mode runs the installed Codex and Claude Code command-line tools in the background. Stop any independently running agent that is editing the same folder before starting.
+
+Both command-line tools must be installed and signed in. Pakati checks their availability and required options before starting; optional executable paths in the app support installations outside the usual locations. It uses the tools' normal account configuration. [Codex programmatic execution](https://learn.chatgpt.com/docs/non-interactive-mode), [Claude programmatic execution](https://code.claude.com/docs/en/headless).
+
+During a managed run, Pakati saves periodic checkpoints and reads the latest task notes without replacing agent edits. If the agent reports confirmed account usage exhaustion, Pakati waits for its managed process group to stop, saves a final checkpoint, restores into a new folder, configures that folder, and records its adoption before starting the other agent. The active folder and assistant update in the task view. The original folder remains available.
+
+The default is one automatic switch per run. If both agents are unavailable, a tool needs approval, authentication fails, or a checkpoint cannot be saved, the run stops with a status explaining the next action. Ordinary replies, temporary HTTP 429 errors, and quota wording inside project files or tool output do not trigger a switch. **Agent response finished** means the run ended; review its work and notes to determine whether the original goal is complete.
+
+Use **Stop** to cancel the active run. Keep Pakati open while it supervises the agents. Quitting requests a stop first; reopening reads the recorded status and does not silently start a new run. Agents should update the shared notes throughout the task, because an exhausted agent may be unable to write a final explanation.
+
+This mode controls agents started by Pakati. It does not automatically take over a conversation already running in another desktop app. Existing desktop sessions can still use the manual handoff below.
+
+Cleanup covers the agent and ordinary tools that remain in its process group. A tool that deliberately detaches into a separate session and drops inherited locks is outside that supervision. Running servers and other external processes are not transferred in a checkpoint.
+
+### Run the controller from source
+
+No app build is needed to exercise the controller. Use a configured Git project, meaningful `.agent-relay/notes.md`, and absolute paths for your checkpoint store and handoff folder:
+
+```sh
+python3 Engine/engine.py auto preflight
+python3 Engine/engine.py auto run --task my-task --store /absolute/path/shared-store --project /absolute/path/project --agent codex --handoff-root /absolute/path/handoffs
+```
+
+From a second terminal, inspect or stop the run:
+
+```sh
+python3 Engine/engine.py auto status --task my-task --store /absolute/path/shared-store
+python3 Engine/engine.py auto stop --task my-task --store /absolute/path/shared-store
+```
+
+Use `--codex-cli /absolute/path/codex` and `--claude-cli /absolute/path/claude` on `auto preflight` or `auto run` to choose specific executables. Keep the store and handoff folder outside the project. Stop the source controller before moving its source files.
+
+## Manual continuation in the other assistant
 
 Stop the current agent from making further edits. Save a checkpoint, or inspect the latest automatic checkpoint if the usage limit has already been reached.
 
@@ -43,7 +79,7 @@ The app keeps its task list, versioned checkpoints, and a stable helper runtime 
 
 Pakati reuses the earlier Agent Relay storage directory, bundle identity, and project filenames so existing tasks and installed hooks continue to work through the rename.
 
-Project hooks point to that stable helper, so moving or closing the app does not break them. The app does not upload checkpoints, read private chat transcripts, make model calls, or modify global Codex or Claude settings. The store may include repository history and source code; keep it private.
+Project hooks point to that stable helper, so moving or closing the app does not break them. Pakati does not upload checkpoints, read private chat transcripts, or modify global Codex or Claude settings. Managed command-line agents communicate with their services and use their normal accounts and usage limits. The store may include repository history and source code; keep it private.
 
 Checkpoint versions are retained; there is no automatic storage pruning in this build.
 
@@ -57,7 +93,7 @@ Checkpoint versions are retained; there is no automatic storage pruning in this 
 - Restores start on a detached Git HEAD. Original branch names are recorded, but original remotes are not copied. Create the appropriate branch and configure the verified remote before publishing.
 - Automatic captures can lag behind edits because tool snapshots are throttled. A crash or undocumented usage-limit screen may prevent a final capture. Save notes and checkpoints throughout the task.
 
-The app prepares a handoff; it does not transfer native chats or automatically submit a new task in another desktop app.
+The manual flow prepares a handoff; the managed mode starts a new command-line continuation. Neither flow transfers native chats or automatically submits a new task in another desktop app. Uncommitted source files and task notes supply the context for a cross-agent continuation.
 
 ## Build from source
 
@@ -77,6 +113,8 @@ Run the source backend checks without building the app:
 
 ```sh
 python3 Engine/test_relay.py
+python3 Engine/test_autopilot.py
+python3 Tests/test_auto_regressions.py --scratch "$PWD/work/auto-regressions"
 ```
 
 On an Apple Silicon Mac, run the native checks using disposable scratch folders:
@@ -84,6 +122,7 @@ On an Apple Silicon Mac, run the native checks using disposable scratch folders:
 ```sh
 python3 Tests/test_notes_model.py --scratch "$PWD/work/model-tests"
 python3 Tests/test_runtime_runner.py --scratch "$PWD/work/runner-tests"
+python3 Tests/test_auto_model.py --scratch "$PWD/work/auto-model-tests"
 ```
 
-See `VERIFICATION.md` for the actual checks completed on this build. The executable packages the Python backend using [PyInstaller's macOS support](https://pyinstaller.org/en/stable/usage.html).
+The managed model driver uses the Swift interpreter/JIT and does not build an app or helper. See `VERIFICATION.md` for the actual checks completed on the packaged version and source update. The executable packages the Python backend using [PyInstaller's macOS support](https://pyinstaller.org/en/stable/usage.html).
