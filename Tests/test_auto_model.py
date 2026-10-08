@@ -18,9 +18,26 @@ extension ManagedEngineProcess {
     func feedForChecks(_ json: [String: Any]) throws {
         consume(try JSONSerialization.data(withJSONObject: json))
     }
+    func launchForChecks(_ executable: URL, _ project: String, _ arguments: [String]) throws {
+        try launch(executable: executable, project: project, arguments: arguments)
+    }
+    var runningForChecks: Bool { process.isRunning }
+}
+
+final class StreamObservation {
+    private let lock = NSLock()
+    private var received = false, beforeExit = false, finished = false
+    func state(beforeExit: Bool) { lock.lock(); received = true; self.beforeExit = beforeExit; lock.unlock() }
+    func finish() { lock.lock(); finished = true; lock.unlock() }
+    func snapshot() -> (received: Bool, beforeExit: Bool, finished: Bool) {
+        lock.lock(); defer { lock.unlock() }; return (received, beforeExit, finished)
+    }
 }
 
 extension RelayModel {
+    func argumentsForChecks(_ task: RelayTask, _ generation: UUID) -> [String] {
+        managedRunArguments(task, generation: generation, optionalCLIArguments: [])
+    }
     func ownForChecks(_ task: RelayTask, _ generation: UUID) {
         workerGenerations[task.id] = generation
         managedProcesses[task.id] = ManagedEngineProcess(onState: { _ in }, onFinish: { _ in })
@@ -68,6 +85,54 @@ extension RelayModel {
     let fm = FileManager.default
     var count = 0
 
+    let canonicalParent = root.appendingPathComponent("canonical-data-parent", isDirectory: true)
+    try fm.createDirectory(at: canonicalParent, withIntermediateDirectories: true)
+    let dataAlias = root.appendingPathComponent("data-parent-alias", isDirectory: true)
+    try fm.createSymbolicLink(at: dataAlias, withDestinationURL: canonicalParent)
+    let aliasedData = dataAlias.appendingPathComponent("missing/app-data", isDirectory: true)
+    guard let physicalParent = realpath(canonicalParent.path, nil) else {
+        throw EngineError.message("The fixture's existing data parent could not be resolved.")
+    }
+    let expectedData = String(cString: physicalParent) + "/missing/app-data"
+    free(physicalParent)
+    let aliasModel = RelayModel(dataDirectory: aliasedData)
+    try check(!fm.fileExists(atPath: expectedData), "Path canonicalization created the fresh data directory.")
+    try check(aliasModel.dataDirectory.path == expectedData && aliasModel.storeURL.path == expectedData + "/checkpoints" &&
+              aliasModel.storePath == expectedData + "/checkpoints" && aliasModel.handoffRootPath == expectedData + "/handoffs",
+              "Managed-run arguments retained an aliased data/store/handoff path before the first checkpoint.")
+    let previousOverride = ProcessInfo.processInfo.environment["AGENT_RELAY_DATA_DIR"]
+    setenv("AGENT_RELAY_DATA_DIR", aliasedData.path, 1)
+    let discoveredData = EngineRunner.dataDirectory().path
+    if let previousOverride { setenv("AGENT_RELAY_DATA_DIR", previousOverride, 1) }
+    else { unsetenv("AGENT_RELAY_DATA_DIR") }
+    try check(discoveredData == expectedData, "App environment discovery retained a symlink alias.")
+    if expectedData.hasPrefix("/private/tmp/") {
+        let systemAlias = URL(fileURLWithPath: expectedData.replacingOccurrences(of: "/private/tmp/", with: "/tmp/"), isDirectory: true)
+        try check(EngineRunner.canonicalDirectoryURL(systemAlias).path == expectedData,
+                  "The /tmp alias survived canonicalization of an absent nested data directory.")
+    }
+    count += 1
+
+    let restoredTask = RelayTask(taskID: "resumed-folder", projectPath: aliasModel.handoffRootPath + "/run-previous/restored-checkout")
+    let resumedArguments = aliasModel.argumentsForChecks(restoredTask, UUID())
+    let laterArguments = aliasModel.argumentsForChecks(restoredTask, UUID())
+    func argument(_ flag: String, _ arguments: [String]) throws -> String {
+        guard let index = arguments.firstIndex(of: flag), index + 1 < arguments.count else {
+            throw EngineError.message("Managed run argv omitted \(flag).")
+        }
+        return arguments[index + 1]
+    }
+    let nextRoot = try argument("--handoff-root", resumedArguments)
+    let laterRoot = try argument("--handoff-root", laterArguments)
+    let resumedProject = try argument("--project", resumedArguments)
+    let resumedStore = try argument("--store", resumedArguments)
+    try check(nextRoot.hasPrefix(expectedData + "/handoffs/run-") && nextRoot != laterRoot,
+              "Repeated starts reused a handoff destination or retained an aliased directory.")
+    try check(!restoredTask.projectPath.hasPrefix(nextRoot + "/") && !nextRoot.hasPrefix(restoredTask.projectPath + "/") &&
+              resumedProject == restoredTask.projectPath && resumedStore == expectedData + "/checkpoints",
+              "A resumed checkout remained inside its new handoff root or lost canonical argv paths.")
+    count += 1
+
     let oldDirectory = root.appendingPathComponent("old-settings", isDirectory: true)
     try fm.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
     try Data(#"{"schemaVersion":1,"tasks":[]}"#.utf8).write(to: oldDirectory.appendingPathComponent("settings.json"))
@@ -85,6 +150,24 @@ extension RelayModel {
     try parser.feedForChecks(["type": "state", "status": "not-a-state"])
     try parser.feedForChecks(["type": "state", "status": "running", "detail": String(repeating: "x", count: 3000), "project_path": "relative-folder"])
     try check(seen.count == 1 && seen[0].detail.count == 2048 && seen[0].projectPath == nil, "NDJSON parser accepted non-state data or unbounded details.")
+    count += 1
+
+    let streamFolder = root.appendingPathComponent("live-stream", isDirectory: true)
+    try fm.createDirectory(at: streamFolder, withIntermediateDirectories: true)
+    let exitingMarker = streamFolder.appendingPathComponent("child-is-exiting")
+    let observation = StreamObservation()
+    weak var observedRunner: ManagedEngineProcess?
+    let liveRunner = ManagedEngineProcess(onState: { _ in
+        observation.state(beforeExit: observedRunner?.runningForChecks == true && !fm.fileExists(atPath: exitingMarker.path))
+    }, onFinish: { _ in observation.finish() })
+    observedRunner = liveRunner
+    let script = "import json, pathlib, sys, time; print(json.dumps({'type':'state','status':'running'}), flush=True); time.sleep(2); pathlib.Path(sys.argv[1]).write_text('exiting')"
+    try liveRunner.launchForChecks(URL(fileURLWithPath: "/usr/bin/python3"), streamFolder.path, ["-u", "-c", script, exitingMarker.path])
+    let streamDeadline = Date().addingTimeInterval(15)
+    while !observation.snapshot().finished && Date() < streamDeadline { try await Task.sleep(nanoseconds: 50_000_000) }
+    let streamed = observation.snapshot()
+    try check(streamed.received && streamed.beforeExit && streamed.finished,
+              "A short flushed state line was withheld until the child exited.")
     count += 1
 
     let (draftModel, draftTask, sourceNotes) = try fixture(root, "draft-transfer")

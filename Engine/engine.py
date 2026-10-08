@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def ensure_path() -> None:

@@ -479,6 +479,11 @@ class Supervisor:
         self.project = None
         self.agent = args.agent
         self.last_version = None
+        # A onefile build has an outer launcher and an application child. A
+        # hard-killed launcher cannot forward a signal to this supervisor.
+        # Source runs retain their existing independent CLI lifetime.
+        self.launcher_pid = os.getppid() if getattr(sys, "frozen", False) else None
+        self.launcher_lost = False
 
     @staticmethod
     def print_event(value):
@@ -502,6 +507,10 @@ class Supervisor:
         self.emit_callback(dict(self.state, type="state"))
 
     def check_cancel(self):
+        if self.launcher_pid is not None and (self.launcher_pid <= 1 or os.getppid() != self.launcher_pid):
+            self.launcher_lost = True
+            self.cancelled = True
+            raise Cancelled("Managed engine launcher exited unexpectedly.")
         request = read_json(self.folder / "cancel.json")
         if self.cancelled or (request and request.get("run_id") == self.state.get("run_id")):
             self.cancelled = True
@@ -820,7 +829,10 @@ class Supervisor:
                 if self.checkout_lock:
                     with contextlib.suppress(AutoError, OSError, relay.RelayError):
                         self.snapshot("stopped", cancelling=True)
-                self.update("stopped", "Managed run stopped. The checkout remains available; inspect its latest checkpoint and notes before continuing.", pid=None, agent_pid=None)
+                if self.launcher_lost:
+                    self.update("interrupted", "The engine launcher ended unexpectedly. Its agent has stopped; inspect the checkout and latest checkpoint before continuing.", pid=None, agent_pid=None)
+                else:
+                    self.update("stopped", "Managed run stopped. The checkout remains available; inspect its latest checkpoint and notes before continuing.", pid=None, agent_pid=None)
                 return 0
             except (AutoError, OSError, relay.RelayError, UnicodeError, subprocess.SubprocessError) as error:
                 if self.child:

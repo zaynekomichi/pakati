@@ -20,7 +20,7 @@ ENGINE = WORK / "dist" / "relay-engine"
 APP = OUTPUTS / "Pakati.app"
 APP_ARCHIVE = OUTPUTS / "Pakati-mac-app.zip"
 DMG = OUTPUTS / "Pakati-mac.dmg"
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 PYINSTALLER_VERSION = "6.22.0"
 
 
@@ -107,7 +107,7 @@ def build_app(python: Path | None, temporary_root: Path) -> Path:
         "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "Pakati",
         "CFBundleIdentifier": "local.agentrelay.desktop", "CFBundleName": "Pakati",
         "CFBundleDisplayName": "Pakati", "CFBundlePackageType": "APPL",
-        "CFBundleShortVersionString": VERSION, "CFBundleVersion": "3",
+        "CFBundleShortVersionString": VERSION, "CFBundleVersion": "4",
         "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
         "NSPrincipalClass": "NSApplication",
         "NSHumanReadableCopyright": "Pakati contributors. MIT License.",

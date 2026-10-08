@@ -1,6 +1,6 @@
-# Verification — Pakati for Mac 0.2.0
+# Verification — Pakati for Mac 0.3.0
 
-The packaged-app checks below describe the existing 0.2.0 downloads. The automatic handoff source update is documented separately at the end; it has not been packaged into a new app or installer.
+The earlier packaged-app checks below describe the 0.2.0 release. Automatic handoff source checks and the 0.3.0 packaging checks are recorded separately at the end.
 
 Verified on an Apple Silicon Mac running macOS 26.6.2. The native app targets macOS 13 or later; macOS 13 itself and Intel Macs were not used for runtime testing. The app and helper are arm64 builds.
 
@@ -30,7 +30,7 @@ The helper bundles Python 3.12.14 using PyInstaller 6.22.0. Mach-O inspection sh
 
 The app still requires Git. A bundled Python runtime does not remove that requirement.
 
-## Limits of this verification
+## Limits of the earlier packaged verification
 
 - Actual Codex and Claude desktop hook trust, startup, and subscription-limit lifecycles have not been validated in a live assistant session. Local hook-event fixtures do not prove that every desktop usage-limit screen invokes a hook.
 - Native conversations, hidden model state, and automatic submission of a continuation prompt were not transferred or tested. The user opens the restored folder and starts the continuation conversation.
@@ -53,18 +53,35 @@ The two native test drivers require the Swift command-line toolchain. They compi
 
 The app is named Pakati. Its Dock icon and in-app mark use a solid black center dot, white surround, and sixteen radial black lines. Legacy storage and hook identifiers are retained for compatibility. This update changes branding and bundled helper display text; handoff behavior and checkpoint format are unchanged. The rebuilt app and helper are checked again before delivery.
 
-## Automatic handoff source update (unbuilt)
+## Automatic handoff source checks (0.3.0)
 
 The source adds a managed controller for installed Codex and Claude Code command-line agents, plus native Start/Stop controls, saved executable paths, and live task status. Confirmed account quota failures trigger a final checkpoint, a fresh restore, configuration and adoption of that checkout, then continuation with the other agent. The default allows one switch; both exhausted accounts stop the run.
 
-Verification uses fake local agents and disposable Git repositories. It does not send model requests, consume subscription credits, or change global assistant configuration. The current app downloads and source archive remain the previously delivered versions; use the Git repository for this source update.
+Verification uses fake local agents and disposable Git repositories. It does not send model requests, consume subscription credits, or change global assistant configuration. Version 0.3.0 includes this mode in the packaged app.
 
 **48 Python checks passed:** 18 original source-engine integration tests, 13 managed-controller tests, and 17 independent automatic-handoff regression tests. Coverage includes final capture and fallback continuation, both accounts exhausted, permission denial, temporary limits and quoted quota text, checkpoint ownership, stopped and killed controllers, child-process cleanup, and stale state handling.
 
-**Eight native model check groups passed through the Swift interpreter/JIT.** They cover saved settings, bounded state parsing, draft preservation, same-folder write exclusion, worker generation guards, stale polling, cleanup status, and cancellation before launch. Installed Codex 0.160.0 and Claude Code 2.1.285 passed read-only version/help preflight checks.
+**Eleven native model check groups passed through the Swift interpreter/JIT.** They cover saved settings, bounded state parsing, draft preservation, same-folder write exclusion, worker generation guards, stale polling, cleanup status, and cancellation before launch. Installed Codex 0.160.0 and Claude Code 2.1.285 passed read-only version/help preflight checks.
 
 The controller checks ordinary response completion separately from quota failure, respects denied tool permissions, preserves agent edits to notes, and maintains exclusive checkout ownership. A successful CLI response is not proof that the user's entire goal has been completed. Subscription event payloads can change; unsupported failures stop with a status instead of guessing and launching a fallback.
 
 Crash and cancellation cleanup covers the managed process group and its ordinary descendants. Intentionally detached processes that create another session and drop inherited locks are outside that guarantee.
 
-The complete native source passed Swift typechecking for arm64 with a macOS 13 deployment target, without creating an app build. Live authenticated agent execution and end-to-end GUI interaction with this new mode are not covered by the fake-agent checks.
+The complete native source passed Swift typechecking for arm64 with a macOS 13 deployment target before packaging. Live authenticated agent execution is not covered by the fake-agent checks.
+
+
+## Packaged release checks (0.3.0)
+
+The arm64 native app and self-contained helper were rebuilt for this release. The updated helper passed 20 core packaged integration tests and 9 packaged automatic-handoff tests. The latter execute a relocated frozen helper with fake local CLIs, covering reciprocal quota transfers, staged/unstaged files and notes, the generated Stop hook, exclusive checkout ownership, temporary errors, high-volume output, cooperative cancellation, and both runtime and launcher hard-crash cleanup.
+
+Packaging exposed an outer-launcher lifetime issue: terminating the PyInstaller launcher could leave its Python supervisor running. A frozen-only parent-liveness check now cancels the run, stops descendants, saves available progress, and records interruption. The fixed packaged crash tests passed, and all 17 independent source regressions passed again.
+
+The native model passed 11 interpreter/JIT check groups, including independent physical-path expectations and a real child process that must deliver a short state callback while it is still alive. CLI arguments resolve existing directory ancestors through POSIX realpath and preserve missing components as strings. This avoids Foundation's temporary-folder alias normalization while retaining backend and runtime-child symlink checks. The complete native source passed arm64/macOS 13 typechecking.
+
+Installed Codex CLI 0.162.0-alpha.2 and Claude Code 2.1.285 passed read-only help/version compatibility checks. Tests did not send authenticated model requests or consume subscription credits.
+
+Long-lived native pipe reads use one bounded POSIX read per chunk. The short-line regression verifies progress callbacks arrive before the child exits. The native app smoke test also invokes the bundled helper on a fresh managed store and requires idle, non-writing status.
+
+Each native Start uses a fresh sibling handoff root tied to that run generation. The native argv regression checks distinct destinations and noncontainment for a project restored by an earlier run, while preserving the controller containment guards.
+
+The compiled 0.3.0 app passed six isolated smoke assertions, including fresh managed idle status through its bundled helper. Its GUI was exercised with fake CLIs: configuration, checkpoint saving, managed Start, Stop, and one simulated usage-limit fallback into a fresh folder. The final app restarted directly from that restored folder, displayed live working status while its fake agent was alive, disabled manual writes during execution, restored controls after Stop, and quit with no remaining fixture agents or helpers.

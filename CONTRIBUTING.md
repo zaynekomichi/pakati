@@ -22,6 +22,7 @@ For packaged helper changes, build the engine and run:
 ```sh
 ./build-mac.sh --engine-only
 python3 Tests/test_packaged.py --engine "$PWD/work/dist/relay-engine" --scratch "$PWD/work/engine-tests"
+python3 Tests/test_auto_packaged.py --engine "$PWD/work/dist/relay-engine" --scratch "$PWD/work/auto-packaged-tests"
 ```
 
 Describe any limits in your verification. Changes to checkpoint formats should include a compatibility plan and preserve existing work on failure.

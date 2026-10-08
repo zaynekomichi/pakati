@@ -4,7 +4,7 @@ import Foundation
 import CryptoKit
 import Darwin
 
-private let relayVersion = "0.2.0"
+private let relayVersion = "0.3.0"
 private let initialNotes = """
 # Task handoff
 
@@ -181,7 +181,10 @@ final class ManagedEngineProcess {
         self.onState = onState; self.onFinish = onFinish
     }
     func start(dataDirectory: URL, project: String, arguments: [String]) throws {
-        process.executableURL = try EngineRunner.prepareRuntime(dataDirectory: dataDirectory)
+        try launch(executable: EngineRunner.prepareRuntime(dataDirectory: dataDirectory), project: project, arguments: arguments)
+    }
+    private func launch(executable: URL, project: String, arguments: [String]) throws {
+        process.executableURL = executable
         process.arguments = arguments; process.environment = EngineRunner.environment()
         process.currentDirectoryURL = URL(fileURLWithPath: project, isDirectory: true)
         process.standardInput = FileHandle.nullDevice
@@ -191,7 +194,7 @@ final class ManagedEngineProcess {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { self.readers.leave() }
             var line = Data(), oversized = false
-            while let chunk = try? self.stdout.fileHandleForReading.read(upToCount: 4096), !chunk.isEmpty {
+            while let chunk = self.readChunk(from: self.stdout.fileHandleForReading) {
                 for byte in chunk {
                     if byte == 10 {
                         if !oversized { self.consume(line) }
@@ -208,11 +211,21 @@ final class ManagedEngineProcess {
         DispatchQueue.global(qos: .userInitiated).async {
             defer { self.readers.leave() }
             // Agent transcripts and stderr never enter the UI or an app log.
-            while let bytes = try? self.stderr.fileHandleForReading.read(upToCount: 4096), !bytes.isEmpty {}
+            while self.readChunk(from: self.stderr.fileHandleForReading) != nil {}
         }
         DispatchQueue.global(qos: .utility).async {
             self.process.waitUntilExit(); self.readers.wait()
             self.onFinish(self.process.terminationStatus)
+        }
+    }
+    private func readChunk(from handle: FileHandle) -> Data? {
+        var bytes = [UInt8](repeating: 0, count: 4096)
+        while true {
+            // One POSIX read returns a short flushed pipe write immediately. Foundation's
+            // read(upToCount:) can wait for the requested size or EOF on this macOS.
+            let count = bytes.withUnsafeMutableBytes { Darwin.read(handle.fileDescriptor, $0.baseAddress, $0.count) }
+            if count > 0 { return Data(bytes.prefix(count)) }
+            if count == 0 || errno != EINTR { return nil }
         }
     }
     private func consume(_ line: Data) {
@@ -236,10 +249,32 @@ enum EngineRunner {
     }
     static func dataDirectory() -> URL {
         if let override = ProcessInfo.processInfo.environment["AGENT_RELAY_DATA_DIR"], !override.isEmpty {
-            return URL(fileURLWithPath: override, isDirectory: true).standardizedFileURL
+            return canonicalDirectoryURL(URL(fileURLWithPath: override, isDirectory: true))
         }
-        return FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Agent Relay", isDirectory: true)
+        return canonicalDirectoryURL(FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Agent Relay", isDirectory: true))
+    }
+    static func canonicalDirectoryURL(_ url: URL) -> URL {
+        var ancestor = url.standardizedFileURL
+        var missingComponents: [String] = []
+        // Resolve an existing ancestor before appending missing folders. Foundation
+        // normalizes even resolved /private/tmp paths back to /tmp; POSIX realpath
+        // preserves the physical path required by the engine's symlink checks.
+        while !FileManager.default.fileExists(atPath: ancestor.path) {
+            let parent = ancestor.deletingLastPathComponent()
+            guard parent.path != ancestor.path else { break }
+            missingComponents.append(ancestor.lastPathComponent)
+            ancestor = parent
+        }
+        var resolvedAncestor = ancestor.path
+        if let physicalPath = realpath(ancestor.path, nil) {
+            resolvedAncestor = String(cString: physicalPath)
+            free(physicalPath)
+        }
+        let path = missingComponents.reversed().reduce(resolvedAncestor) {
+            ($0 as NSString).appendingPathComponent($1)
+        }
+        return URL(fileURLWithPath: path, isDirectory: true)
     }
     static func prepareRuntime(dataDirectory: URL) throws -> URL {
         guard let bundled = Bundle.main.resourceURL?.appendingPathComponent("relay-engine"),
@@ -325,13 +360,16 @@ enum EngineRunner {
     private var statusChecks: Set<UUID> = []
     private var observedTasks: Set<UUID> = []
     private var quitting = false
-    var storeURL: URL { dataDirectory.appendingPathComponent("checkpoints", isDirectory: true) }
+    // Keep physical directory strings through CLI argument construction.
+    var storePath: String { (dataDirectory.path as NSString).appendingPathComponent("checkpoints") }
+    var handoffRootPath: String { (dataDirectory.path as NSString).appendingPathComponent("handoffs") }
+    var storeURL: URL { URL(fileURLWithPath: storePath, isDirectory: true) }
     var selectedTask: RelayTask? { tasks.first { $0.id == selectedID } }
     var checkpoint: Checkpoint? { history.first { $0.id == selectedVersion } ?? history.first }
 
     init(dataDirectory: URL = EngineRunner.dataDirectory()) {
-        self.dataDirectory = dataDirectory
-        let settings = dataDirectory.appendingPathComponent("settings.json")
+        self.dataDirectory = EngineRunner.canonicalDirectoryURL(dataDirectory)
+        let settings = self.dataDirectory.appendingPathComponent("settings.json")
         if FileManager.default.fileExists(atPath: settings.path) {
             do {
                 let saved = try JSONDecoder().decode(SavedSettings.self, from: Data(contentsOf: settings))
@@ -384,19 +422,7 @@ enum EngineRunner {
         return value["task"] as? String == task.taskID && configuredStore == expectedStore && value["enabled"] as? Bool == true
     }
     private func canonicalStorePath(_ url: URL) -> String {
-        var ancestor = url.standardizedFileURL
-        var missingComponents: [String] = []
-        // Foundation leaves an absent path unresolved. Resolve its existing ancestor first;
-        // the checkpoint store does not exist yet when a project is initially configured.
-        while !FileManager.default.fileExists(atPath: ancestor.path) {
-            let parent = ancestor.deletingLastPathComponent()
-            guard parent.path != ancestor.path else { break }
-            missingComponents.append(ancestor.lastPathComponent)
-            ancestor = parent
-        }
-        return missingComponents.reversed().reduce(ancestor.resolvingSymlinksInPath().path) {
-            ($0 as NSString).appendingPathComponent($1)
-        }
+        EngineRunner.canonicalDirectoryURL(url).path
     }
     func selectTask() {
         status = nil; restoredPath = nil; selectedVersion = nil; savedNotes = ""
@@ -597,7 +623,7 @@ enum EngineRunner {
         let revision = activityRevisions[task.id, default: 0]
         if showChecking, !isManagedTaskActive(task) { managedStates[task.id] = ManagedRunState(status: "checking") }
         let directory = dataDirectory
-        let arguments = ["auto", "status", "--task", task.taskID, "--store", storeURL.path]
+        let arguments = ["auto", "status", "--task", task.taskID, "--store", storePath]
         do {
             let output = try await Task.detached(priority: .utility) { try EngineRunner.run(dataDirectory: directory, arguments: arguments) }.value
             guard let json = output.json, let state = ManagedRunState(json) else { throw EngineError.message("The engine returned an invalid managed-run status.") }
@@ -618,6 +644,14 @@ enum EngineRunner {
               diskNotes == baseline, task.notes == baseline else {
             throw EngineError.message("Save your notes and checkpoint first. If the project notes changed in another agent, copy any unsaved draft you need, load the current project notes, and merge your changes before saving. Your draft and project notes have been preserved.")
         }
+    }
+    private func managedRunArguments(_ task: RelayTask, generation: UUID, optionalCLIArguments: [String]) -> [String] {
+        // A restored checkout can live below an earlier run's handoff root. Give each
+        // new run a sibling destination so the engine's containment guards remain valid.
+        let runRoot = (handoffRootPath as NSString).appendingPathComponent("run-\(generation.uuidString.lowercased())")
+        return ["auto", "run", "--task", task.taskID, "--store", storePath,
+            "--project", task.projectPath, "--agent", task.assistant.rawValue,
+            "--handoff-root", runRoot, "--max-switches", "1"] + optionalCLIArguments
     }
     func startManagedRun(_ task: RelayTask) {
         guard !busy, !isManagedWriting(task), !quitting else { return }
@@ -640,7 +674,7 @@ enum EngineRunner {
             managedStates[task.id] = ManagedRunState(status: "starting", detail: "Checking the installed command-line agents.", projectPath: task.projectPath, agent: task.assistant.rawValue)
             busy = true; operation = "Prepare automatic handoff"; status = nil
             let directory = dataDirectory
-            let statusArguments = ["auto", "status", "--task", task.taskID, "--store", storeURL.path]
+            let statusArguments = ["auto", "status", "--task", task.taskID, "--store", storePath]
             Task {
                 do {
                     let ready = try await Task.detached(priority: .userInitiated) {
@@ -660,10 +694,7 @@ enum EngineRunner {
                     }
                     try self.requireSavedNotes(task)
                     self.persist()
-                    let arguments = ["auto", "run", "--task", task.taskID, "--store", self.storeURL.path,
-                        "--project", task.projectPath, "--agent", task.assistant.rawValue,
-                        "--handoff-root", self.dataDirectory.appendingPathComponent("handoffs", isDirectory: true).path,
-                        "--max-switches", "1"] + optionalCLIArguments
+                    let arguments = self.managedRunArguments(task, generation: generation, optionalCLIArguments: optionalCLIArguments)
                     let runner = ManagedEngineProcess(onState: { [weak self, weak task] state in
                         Task { @MainActor in
                             guard let self = self, let task = task else { return }
@@ -702,7 +733,7 @@ enum EngineRunner {
         stoppingTasks.insert(task.id)
         managedStates[task.id] = ManagedRunState(status: "stopping", detail: "Waiting for the worker to stop its agent and preserve the final checkpoint.", projectPath: task.projectPath, agent: task.assistant.rawValue)
         let directory = dataDirectory
-        let arguments = ["auto", "stop", "--task", task.taskID, "--store", storeURL.path]
+        let arguments = ["auto", "stop", "--task", task.taskID, "--store", storePath]
         Task {
             defer { self.stoppingTasks.remove(task.id) }
             do {
@@ -734,7 +765,7 @@ enum EngineRunner {
     }
     func configure(_ task: RelayTask) {
         guard !isManagedWriting(task) else { showManagedWriteConflict(); return }
-        execute("Configure project", arguments: ["setup", "--project", task.projectPath, "--store", storeURL.path, "--task", task.taskID]) { output in
+        execute("Configure project", arguments: ["setup", "--project", task.projectPath, "--store", storePath, "--task", task.taskID]) { output in
             task.configured = self.configurationMatches(task)
             self.status = RelayStatus(title: "Project configured", detail: output.stdout + output.stderr)
         }
@@ -767,7 +798,7 @@ enum EngineRunner {
             task.notesBaseline = notes + "\n"
             task.notes = notes + "\n"
             execute("Save checkpoint", arguments: ["checkpoint", "--project", task.projectPath, "--task", task.taskID,
-                    "--store", storeURL.path, "--agent", task.assistant.rawValue, "--notes", notesURL.path]) { output in
+                    "--store", storePath, "--agent", task.assistant.rawValue, "--notes", notesURL.path]) { output in
                 guard let value = output.json, let version = value["version"] as? String else { throw EngineError.message("The engine did not return a checkpoint version.") }
                 self.selectedVersion = version; self.refreshHistory(); self.savedNotes = notes
                 let excluded = value["excluded_untracked"] as? [String] ?? []
@@ -783,7 +814,7 @@ enum EngineRunner {
             status = RelayStatus(title: "No checkpoints yet", detail: "Configure the project, add task notes, and save the first checkpoint.")
             return
         }
-        execute("Load checkpoint", arguments: ["show", "--task", task.taskID, "--store", storeURL.path, "--version", version]) { output in
+        execute("Load checkpoint", arguments: ["show", "--task", task.taskID, "--store", storePath, "--version", version]) { output in
             guard let value = output.json, let notes = value["notes"] as? String else { throw EngineError.message("The engine did not return checkpoint notes.") }
             self.savedNotes = notes
             self.status = RelayStatus(title: "Checkpoint verified", detail: "The saved code and notes passed the engine's integrity checks.")
@@ -802,7 +833,7 @@ enum EngineRunner {
             status = RelayStatus(title: "Choose a new folder name", detail: "The destination already exists. Restore requires an absent folder.", isError: true)
             return
         }
-        execute("Restore handoff", arguments: ["restore", "--task", task.taskID, "--store", storeURL.path, "--version", version, "--into", destination.path]) { output in
+        execute("Restore handoff", arguments: ["restore", "--task", task.taskID, "--store", storePath, "--version", version, "--into", destination.path]) { output in
             guard let value = output.json, let project = value["project"] as? String else { throw EngineError.message("The engine did not return a restored project folder.") }
             task.projectPath = project; task.configured = self.configurationMatches(task)
             task.notesBaseline = self.readProjectNotes(task)
@@ -1331,6 +1362,22 @@ struct RelayWindow: View {
     return results
 }
 
+private func verifyManagedStatus(dataDirectory: URL) throws -> Bool {
+    let rootPath = (dataDirectory.path as NSString).appendingPathComponent(".managed-smoke-\(UUID().uuidString)")
+    let storePath = (rootPath as NSString).appendingPathComponent("checkpoints")
+    defer { try? FileManager.default.removeItem(atPath: rootPath) }
+    guard !FileManager.default.fileExists(atPath: storePath) else {
+        throw EngineError.message("The managed-status smoke store must be fresh.")
+    }
+    let output = try EngineRunner.run(dataDirectory: dataDirectory,
+            arguments: ["auto", "status", "--task", "native-smoke", "--store", storePath])
+    guard let json = output.json, let state = ManagedRunState(json),
+          state.status == "idle", !state.blocksWrites else {
+        throw EngineError.message("The native app and bundled helper did not return an idle managed status for a fresh store.")
+    }
+    return true
+}
+
 @main struct AgentRelayApp: App {
     @StateObject private var model = RelayModel()
     @NSApplicationDelegateAdaptor(RelayApplicationDelegate.self) private var appDelegate
@@ -1344,8 +1391,10 @@ struct RelayWindow: View {
                 let engine = try EngineRunner.prepareRuntime(dataDirectory: directory)
                 let output = try EngineRunner.run(dataDirectory: directory, arguments: ["--help"])
                 let modelChecks = try verifyModel(dataDirectory: directory)
+                let managedStatusReady = try verifyManagedStatus(dataDirectory: directory)
                 let result: [String: Any] = ["status": "ok", "version": relayVersion, "data_directory": directory.path,
-                                          "engine": engine.path, "engine_help": output.stdout, "model_checks": modelChecks]
+                                          "engine": engine.path, "engine_help": output.stdout, "model_checks": modelChecks,
+                                          "fresh_managed_status_idle": managedStatusReady]
                 let data = try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys])
                 FileHandle.standardOutput.write(data); FileHandle.standardOutput.write(Data("\n".utf8)); exit(0)
             } catch { fputs("\(error.localizedDescription)\n", stderr); exit(2) }

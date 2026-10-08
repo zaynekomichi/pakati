@@ -10,7 +10,7 @@ Pakati is open source under the [MIT license](LICENSE). Contributions are welcom
 
 ## Install
 
-The automatic handoff mode described below is a source update. The existing 0.2.0 app downloads have not been rebuilt with this feature.
+Version 0.3.0 includes the automatic handoff mode described below.
 
 Open `Pakati-mac.dmg` and drag **Pakati** into **Applications**. Open the app from Applications. `Pakati-mac-app.zip` is an alternative copy of the same app; `Pakati-mac-source.zip` contains the editable source and build instructions.
 
